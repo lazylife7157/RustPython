@@ -8,7 +8,9 @@ use clap::{App, AppSettings, Arg, ArgMatches};
 use rustpython_compiler::{compile, error::CompileError, error::CompileErrorType};
 use rustpython_parser::error::ParseErrorType;
 use rustpython_vm::{
-    import, print_exception,
+    import, match_class,
+    obj::{objint::PyInt, objtuple::PyTuple, objtype},
+    print_exception,
     pyobject::{ItemProtocol, PyObjectRef, PyResult},
     scope::Scope,
     util, PySettings, VirtualMachine,
@@ -30,14 +32,57 @@ fn main() {
     let vm = VirtualMachine::new(settings);
 
     let res = run_rustpython(&vm, &matches);
-    // See if any exception leaked out:
-    handle_exception(&vm, res);
 
     #[cfg(feature = "flame-it")]
     {
         main_guard.end();
         if let Err(e) = write_profile(&matches) {
             error!("Error writing profile information: {}", e);
+        }
+    }
+
+    // See if any exception leaked out:
+    if let Err(err) = res {
+        if objtype::isinstance(&err, &vm.ctx.exceptions.system_exit) {
+            let args = vm.get_attribute(err.clone(), "args").unwrap();
+            let args = args.payload::<PyTuple>().expect("'args' must be a tuple");
+            match args.elements.len() {
+                0 => return,
+                1 => match_class!(match args.elements[0].clone() {
+                    i @ PyInt => {
+                        use num_traits::cast::ToPrimitive;
+                        std::process::exit(i.as_bigint().to_i32().unwrap());
+                    }
+                    _ => {
+                        if vm.is_none(&args.elements[0]) {
+                            return;
+                        }
+                        let s = vm.to_str(&args.elements[0]);
+                        let s = s
+                            .as_ref()
+                            .ok()
+                            .map_or("<element str() failed>", |s| s.as_str());
+                        println!("{}", s);
+                    }
+                }),
+                _ => {
+                    print!("(");
+                    for (i, elem) in args.elements.iter().enumerate() {
+                        if i != 0 {
+                            print!(", ")
+                        }
+                        let s = vm.to_str(elem);
+                        let s = s
+                            .as_ref()
+                            .ok()
+                            .map_or("<element str() failed>", |s| s.as_str());
+                        print!("{}", s)
+                    }
+                    print!(")");
+                }
+            }
+        } else {
+            print_exception(&vm, &err);
             process::exit(1);
         }
     }
@@ -349,13 +394,6 @@ fn _run_string(vm: &VirtualMachine, scope: Scope, source: &str, source_path: Str
     vm.run_code_obj(code_obj, scope)
 }
 
-fn handle_exception<T>(vm: &VirtualMachine, result: PyResult<T>) {
-    if let Err(err) = result {
-        print_exception(vm, &err);
-        process::exit(1);
-    }
-}
-
 fn run_command(vm: &VirtualMachine, scope: Scope, source: String) -> PyResult<()> {
     debug!("Running command {}", source);
     _run_string(vm, scope, &source, "<stdin>".to_string())?;
@@ -560,6 +598,10 @@ fn run_shell(vm: &VirtualMachine, scope: Scope) -> PyResult<()> {
         };
 
         if let Err(exc) = result {
+            if objtype::isinstance(&exc, &vm.ctx.exceptions.system_exit) {
+                repl.save_history(&repl_history_path).unwrap();
+                return Err(exc);
+            }
             print_exception(vm, &exc);
         }
     }
